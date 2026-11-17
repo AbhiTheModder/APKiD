@@ -176,3 +176,152 @@ def test_decompress_xz_entry_bounds_concatenated_streams(scanner: Scanner):
     info.compress_size = len(payload)
 
     assert scanner._decompress_xz_entry(io.BytesIO(payload), info, 0) is None
+
+
+def test_decompress_xz_entry_keeps_valid_stream_before_trailing_junk(scanner: Scanner):
+    # `lzma.decompress()` ignores a tail that is not a stream and returns what
+    # the valid streams produced, so this path has to do the same instead of
+    # discarding the whole entry.
+    payload = lzma.compress(b'AAAABBBB') + b'not-an-xz-stream'
+    info = zipfile.ZipInfo('classes.dex')
+    info.file_size = 8
+    info.compress_size = len(payload)
+
+    assert lzma.decompress(payload) == b'AAAABBBB'
+    assert scanner._decompress_xz_entry(io.BytesIO(payload), info, 0) == b'AAAABBBB'
+
+
+def test_decompress_xz_entry_honours_decoder_memory_limit(scanner: Scanner, monkeypatch):
+    # Encoding a stream that declares a huge dictionary would need a huge
+    # encoder, so the floor is patched down instead and a normal stream is
+    # expected to be rejected rather than decoded.
+    monkeypatch.setattr('apkid.apkid.MIN_DECODER_MEMORY', 1024)
+    scanner.options.entry_max_scan_size = 0
+    payload = lzma.compress(b'A' * 4096)
+    info = zipfile.ZipInfo('classes.dex')
+    info.file_size = 4096
+    info.compress_size = len(payload)
+
+    assert scanner._decompress_xz_entry(io.BytesIO(payload), info, 0) is None
+
+
+def test_decompress_xz_entry_reads_compressed_data_in_blocks(scanner: Scanner, monkeypatch):
+    # `compress_size` is attacker-controlled, so the compressed payload is not
+    # buffered up front; the decoder is fed in blocks instead.
+    monkeypatch.setattr('apkid.apkid.XZ_COMPRESSED_READ_SIZE', 16)
+    payload = lzma.compress(b'A' * 4096)
+    info = zipfile.ZipInfo('classes.dex')
+    info.file_size = 4096
+    info.compress_size = len(payload)
+
+    reads = []
+
+    class CountingReader(io.BytesIO):
+        def read(self, size=-1):
+            reads.append(size)
+            return super().read(size)
+
+    assert scanner._decompress_xz_entry(CountingReader(payload), info, 0) == b'A' * 4096
+    assert len(reads) > 1
+    assert max(reads) <= 16
+
+
+def test_decompress_xz_entry_reads_past_a_stream_boundary(scanner: Scanner, monkeypatch):
+    # A stream that ends exactly on a read boundary has no `unused_data`; the
+    # entry is not over as long as compressed bytes are left.
+    first = lzma.compress(b'AAAA')
+    payload = first + lzma.compress(b'BBBB')
+    monkeypatch.setattr('apkid.apkid.XZ_COMPRESSED_READ_SIZE', len(first))
+    info = zipfile.ZipInfo('classes.dex')
+    info.file_size = 8
+    info.compress_size = len(payload)
+
+    assert scanner._decompress_xz_entry(io.BytesIO(payload), info, 0) == b'AAAABBBB'
+
+
+def test_decompress_xz_entry_filters_on_entry_bytes(scanner: Scanner):
+    # The filter sees the entry, not the first stream, so a short first stream
+    # must not decide the magic check on its own.
+    payload = lzma.compress(b'de') + lzma.compress(b'x\nAAAA')
+    info = zipfile.ZipInfo('classes.dex')
+    info.file_size = 8
+    info.compress_size = len(payload)
+    seen = []
+
+    def should_scan(head):
+        seen.append(head)
+        return head == b'dex\n'
+
+    assert scanner._decompress_xz_entry(io.BytesIO(payload), info, 0, should_scan=should_scan) == b'dex\nAAAA'
+    assert seen == [b'dex\n']
+
+
+def test_decompress_xz_entry_discards_a_stream_that_never_completes(scanner: Scanner, monkeypatch):
+    # Data that failed to decompress is not a partial entry: only completed
+    # streams are kept, as with `lzma.decompress()`.
+    monkeypatch.setattr('apkid.apkid.XZ_COMPRESSED_READ_SIZE', 16)
+    payload = bytearray(lzma.compress(b'B' * 4096))
+    payload[-1] ^= 0xFF
+    info = zipfile.ZipInfo('classes.dex')
+    info.file_size = 4096
+    info.compress_size = len(payload)
+
+    assert scanner._decompress_xz_entry(io.BytesIO(bytes(payload)), info, 0) is None
+
+
+def test_decompress_xz_entry_drops_a_truncated_later_stream(scanner: Scanner):
+    # Runs out of input inside the second stream: only the first one counts.
+    first = lzma.compress(b'A' * 4096)
+    payload = first + lzma.compress(b'B' * 4096)[:-8]
+    info = zipfile.ZipInfo('classes.dex')
+    info.file_size = 8192
+    info.compress_size = len(payload)
+
+    assert scanner._decompress_xz_entry(io.BytesIO(payload), info, 0) == b'A' * 4096
+
+
+def test_scan_applies_typing_to_xz_entries(scanner: Scanner):
+    # The XZ branch used to scan every entry regardless of `--typing`.
+    entries = {'classes.dex': b'\x89PNG\r\n\x1a\n' + b'A' * 128}
+    with make_temp_xz_zip(entries) as tz:
+        results = scanner.scan_file(tz.name)
+
+    assert f'{tz.name}!classes.dex' not in results
+
+
+def test_scan_applies_filename_typing_to_xz_entries(scanner: Scanner):
+    scanner.options.typing = 'filename'
+    entries = {'assets/picture.png': b'dex\n' + b'A' * 128}
+    with make_temp_xz_zip(entries) as tz, open(tz.name, 'rb') as f:
+        results = scanner.scan_file_obj(f, 'test.apk')
+
+    assert 'test.apk!assets/picture.png' not in results
+
+
+def test_scan_scans_regular_entry_at_max_scan_size(scanner: Scanner):
+    scanner.options.entry_max_scan_size = 1024
+    entries = {'classes.dex': b'dex\n' + b'A' * (1024 - 4)}
+    with make_temp_zip(entries) as tz:
+        results = scanner.scan_file(tz.name)
+
+    assert f'{tz.name}!classes.dex' in results
+
+
+def test_scan_scans_short_entry_at_a_small_budget(scanner: Scanner):
+    # Entries shorter than the magic size still fit a budget that small.
+    scanner.options.entry_max_scan_size = 3
+    scanner.options.typing = 'filename'
+    entries = {'classes.dex': b'dex'}
+    with make_temp_zip(entries) as tz, open(tz.name, 'rb') as f:
+        results = scanner.scan_file_obj(f, 'test.apk')
+
+    assert 'test.apk!classes.dex' in results
+
+
+def test_scan_skips_regular_entry_over_max_scan_size(scanner: Scanner):
+    scanner.options.entry_max_scan_size = 1024
+    entries = {'classes.dex': b'dex\n' + b'A' * (1025 - 4)}
+    with make_temp_zip(entries) as tz:
+        results = scanner.scan_file(tz.name)
+
+    assert f'{tz.name}!classes.dex' not in results

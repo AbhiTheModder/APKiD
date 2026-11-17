@@ -34,7 +34,7 @@ import zipfile
 import zlib
 from typing import Dict, Optional, Union, IO
 
-XZ_COMPRESSION_TYPE = 95
+from apkid.apkid import XZ_COMPRESSION_TYPE
 
 
 def load_data(file_path: str, is_json: bool = False) -> Union[str, dict]:
@@ -94,11 +94,7 @@ def make_xz_zip(entries: Dict[str, bytes], declared_sizes: Optional[Dict[str, in
 
 
 def make_temp_xz_zip(entries: Dict[str, bytes], declared_sizes: Optional[Dict[str, int]] = None) -> IO:
-    with make_xz_zip(entries, declared_sizes) as file_obj:
-        tz = tempfile.NamedTemporaryFile()
-        tz.write(file_obj.read())
-    tz.flush()
-    return tz
+    return make_temp_file(make_xz_zip(entries, declared_sizes).read())
 
 
 def make_temp_zip(entries: Dict[str, bytes]) -> IO:
