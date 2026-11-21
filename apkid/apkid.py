@@ -218,41 +218,38 @@ class Scanner(object):
 
         try:
             with zf.open(info) as entry:
+                # The declared size is attacker-controlled, so this is only a
+                # cheap early reject, but it is also sufficient: `ZipExtFile`
+                # stops reading at `info.file_size`, so a header that
+                # understates the size cannot make the read below return more
+                # than the budget.
+                if budget is not None and info.file_size > budget:
+                    if self.options.verbose:
+                        print(f"[W] Skipping entry {info.filename}: "
+                              f"declared size {info.file_size} exceeds {budget}")
+                    return
                 # Python 3.6 zip entries are not seek'able :(
                 head = entry.read(SCAN_MAGIC_SIZE)
                 entry_buffer: IO = io.BytesIO(head)
                 entry_buffer.seek(0)
                 if not self._should_scan(entry_buffer, info.filename):
                     return
-                # The declared size is attacker-controlled, so this is only a
-                # cheap early reject; the bounded read below is what holds.
-                if budget is not None and info.file_size > budget:
-                    if self.options.verbose:
-                        print(f"[W] Skipping entry {info.filename}: "
-                              f"declared size {info.file_size} exceeds {budget}")
-                    return
                 entry_buffer.seek(len(head))
                 if budget is None:
                     entry_buffer.write(entry.read())
                 else:
-                    # Read one byte past the budget so "exactly at" and "over"
-                    # can be told apart, and never buffer more than that.
-                    # `zipfile` itself may decode BZIP2/LZMA entries eagerly, so
-                    # this bounds what is kept, not the stdlib's allocation.
-                    read_so_far = len(head)
-                    limit = budget + 1 - read_so_far
-                    while limit > 0:
-                        chunk = entry.read(min(limit, ENTRY_READ_CHUNK_SIZE))
+                    # `read()` stops at `info.file_size`, but that bounds what
+                    # is kept, not the decoder's own allocation: given no
+                    # length, `zipfile` reads as much compressed input as
+                    # `compress_size` declares and inflates it in one call
+                    # before trimming to the declared size. Chunked reads keep
+                    # a single call bounded even when the header understates
+                    # the size.
+                    while True:
+                        chunk = entry.read(ENTRY_READ_CHUNK_SIZE)
                         if not chunk:
                             break
                         entry_buffer.write(chunk)
-                        read_so_far += len(chunk)
-                        limit -= len(chunk)
-                    if read_so_far > budget:
-                        if self.options.verbose:
-                            print(f"[W] Skipping entry {info.filename}: "
-                                  f"size exceeds {budget}")
-                        return
         except zipfile.BadZipFile as e:
             if "Overlapped entries" in str(e) or "possible zip bomb" in str(e):
                 if self.options.verbose:
@@ -267,14 +264,20 @@ class Scanner(object):
                 # decided without decompressing anything.
                 if self.options.typing == 'filename' and not self._should_scan(io.BytesIO(b''), info.filename):
                     return
+                # Only `--typing magic` needs the filter to peek at the
+                # decompressed bytes; `filename` was decided above, and
+                # `typing` None scans everything.
+                def peek_magic(head: bytes) -> bool:
+                    return self._should_scan(io.BytesIO(head), info.filename)
+
+                should_scan = peek_magic if self.options.typing == 'magic' else None
                 with open(zf.filename, 'rb') as raw_zip:
                     raw_zip.seek(info.header_offset + ZIP_LFH_FIELDS_SIZE)
                     filename_len = struct.unpack('<H', raw_zip.read(2))[0]
                     extra_len = struct.unpack('<H', raw_zip.read(2))[0]
                     data_offset = info.header_offset + ZIP_LFH_HEADER_SIZE + filename_len + extra_len
                     decompressed_data = self._decompress_xz_entry(
-                        raw_zip, info, data_offset,
-                        should_scan=lambda head: self._should_scan(io.BytesIO(head), info.filename))
+                        raw_zip, info, data_offset, should_scan=should_scan)
                     if decompressed_data is None:
                         return
                     entry_buffer = io.BytesIO(decompressed_data)
@@ -352,14 +355,13 @@ class Scanner(object):
                 if input_remaining > 0:
                     block = raw_zip.read(min(input_remaining, XZ_COMPRESSED_READ_SIZE))
                     input_remaining -= len(block)
-                if not block and not completed_streams:
-                    print(f"[E] Failed to decompress {info.filename}: truncated XZ stream")
-                    return None
                 if not block:
-                    # The input ended inside a later stream; like a failed
-                    # tail, it is dropped and the completed streams are kept.
-                    del output[stream_start:]
-                    break
+                    # The input ended inside a stream. `lzma.decompress()`
+                    # rejects this even when earlier streams completed, so the
+                    # entry is malformed rather than a valid prefix.
+                    print(f"[E] Failed to decompress {info.filename}: truncated XZ stream",
+                          file=sys.stderr)
+                    return None
             else:
                 block = b''
 
@@ -375,13 +377,15 @@ class Scanner(object):
             try:
                 chunk = decompressor.decompress(block, max_length=max_length)
             except lzma.LZMAError as e:
-                # Match `lzma.decompress()`, which keeps what completed streams
-                # produced when the tail is not a valid stream (stream padding,
-                # trailing junk) instead of discarding the whole entry.
-                if completed_streams:
+                # A tail that is not a stream (trailing junk) is ignored and
+                # the completed streams are kept, as `lzma.decompress()` does.
+                # A memory-limit refusal is not a bad tail: the data asked for
+                # more decoder memory than allowed, so the entry is rejected
+                # rather than scanned in part.
+                if completed_streams and 'memory usage limit' not in str(e).lower():
                     del output[stream_start:]
                     break
-                print(f"[E] Failed to decompress {info.filename}: {e}")
+                print(f"[E] Failed to decompress {info.filename}: {e}", file=sys.stderr)
                 return None
 
             output += chunk
@@ -403,10 +407,28 @@ class Scanner(object):
                 completed_streams += 1
                 # XZ allows concatenated streams, and `lzma.decompress()` consumes them all.
                 pending = decompressor.unused_data
-                if not pending and input_remaining <= 0:
+                stream_start = len(output)
+                # Stream Padding is a multiple of four null bytes between or
+                # after streams. It is valid XZ, so it is skipped rather than
+                # mistaken for a new stream that the input cuts short.
+                padding = 0
+                while True:
+                    stripped = pending.lstrip(b'\x00')
+                    padding += len(pending) - len(stripped)
+                    pending = stripped
+                    if pending or input_remaining <= 0:
+                        break
+                    pending = raw_zip.read(min(input_remaining, XZ_COMPRESSED_READ_SIZE))
+                    input_remaining -= len(pending)
+                    if not pending:
+                        break
+                if padding % 4:
+                    print(f"[E] Failed to decompress {info.filename}: "
+                          f"invalid XZ stream padding", file=sys.stderr)
+                    return None
+                if not pending:
                     break
                 decompressor = lzma.LZMADecompressor(memlimit=decoder_memory_limit)
-                stream_start = len(output)
 
         if not filtered and not should_scan(bytes(output[:SCAN_MAGIC_SIZE])):
             return None

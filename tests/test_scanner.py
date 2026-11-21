@@ -28,6 +28,8 @@ import io
 import lzma
 import zipfile
 
+import pytest
+
 from apkid.apkid import MIN_DECODER_MEMORY, Scanner
 from .factories import make_temp_zip, make_temp_xz_zip, make_temp_file, make_zip
 
@@ -113,6 +115,27 @@ def test_scan_skips_xz_entry_over_max_scan_size(scanner: Scanner):
         results = scanner.scan_file(tz.name)
 
     assert f'{tz.name}!classes.dex' not in results
+
+
+def test_scan_reads_entries_in_chunks_when_budgeted(scanner: Scanner, monkeypatch):
+    # A DEFLATE header can understate `file_size`; a single unbounded `read()`
+    # would let `zipfile` inflate the whole entry in one call before trimming
+    # to the declared size, so the budgeted path reads in fixed-size chunks.
+    monkeypatch.setattr('apkid.apkid.ENTRY_READ_CHUNK_SIZE', 8)
+    reads = []
+    real_read = zipfile.ZipExtFile.read
+
+    def recording_read(self, n=-1):
+        reads.append(n)
+        return real_read(self, n)
+
+    monkeypatch.setattr(zipfile.ZipExtFile, 'read', recording_read)
+
+    with make_temp_zip({'classes.dex': b'dex\n' + b'A' * 64}) as tz:
+        scanner.scan_file(tz.name)
+
+    assert reads
+    assert max(reads) <= 8
 
 
 def test_scan_skips_xz_entry_with_lying_declared_size(scanner: Scanner):
@@ -269,15 +292,65 @@ def test_decompress_xz_entry_discards_a_stream_that_never_completes(scanner: Sca
     assert scanner._decompress_xz_entry(io.BytesIO(bytes(payload)), info, 0) is None
 
 
-def test_decompress_xz_entry_drops_a_truncated_later_stream(scanner: Scanner):
-    # Runs out of input inside the second stream: only the first one counts.
+def test_decompress_xz_entry_rejects_a_truncated_later_stream(scanner: Scanner):
+    # Runs out of input inside the second stream. `lzma.decompress()` raises
+    # here even though the first stream completed, so the entry is malformed
+    # rather than a valid prefix worth scanning.
     first = lzma.compress(b'A' * 4096)
     payload = first + lzma.compress(b'B' * 4096)[:-8]
     info = zipfile.ZipInfo('classes.dex')
     info.file_size = 8192
     info.compress_size = len(payload)
 
-    assert scanner._decompress_xz_entry(io.BytesIO(payload), info, 0) == b'A' * 4096
+    assert scanner._decompress_xz_entry(io.BytesIO(payload), info, 0) is None
+
+
+def test_decompress_xz_entry_accepts_stream_padding(scanner: Scanner):
+    # Trailing null bytes in multiples of four are valid XZ Stream Padding,
+    # not a new stream. (`lzma.decompress()` rejects padding, so it cannot be
+    # used as the reference here.)
+    payload = lzma.compress(b'AAAA') + b'\x00' * 8
+    info = zipfile.ZipInfo('classes.dex')
+    info.file_size = 4
+    info.compress_size = len(payload)
+
+    with pytest.raises(lzma.LZMAError):
+        lzma.decompress(payload)
+    assert scanner._decompress_xz_entry(io.BytesIO(payload), info, 0) == b'AAAA'
+
+
+def test_decompress_xz_entry_accepts_padding_between_streams(scanner: Scanner):
+    payload = lzma.compress(b'AAAA') + b'\x00' * 4 + lzma.compress(b'BBBB')
+    info = zipfile.ZipInfo('classes.dex')
+    info.file_size = 8
+    info.compress_size = len(payload)
+
+    assert scanner._decompress_xz_entry(io.BytesIO(payload), info, 0) == b'AAAABBBB'
+
+
+def test_decompress_xz_entry_rejects_invalid_stream_padding(scanner: Scanner):
+    # Stream Padding has to be a multiple of four null bytes.
+    payload = lzma.compress(b'AAAA') + b'\x00' * 2
+    info = zipfile.ZipInfo('classes.dex')
+    info.file_size = 4
+    info.compress_size = len(payload)
+
+    assert scanner._decompress_xz_entry(io.BytesIO(payload), info, 0) is None
+
+
+def test_decompress_xz_entry_rejects_later_stream_over_memory_limit(scanner: Scanner, monkeypatch):
+    # A later stream that declares a larger dictionary than the decoder may
+    # allocate is not a bad tail: the entry is rejected instead of returning
+    # the completed first stream.
+    monkeypatch.setattr('apkid.apkid.MIN_DECODER_MEMORY', 128 * 1024)
+    scanner.options.entry_max_scan_size = 0
+    first = lzma.compress(b'A' * 4096, filters=[{'id': lzma.FILTER_LZMA2, 'dict_size': 4096}])
+    payload = first + lzma.compress(b'B' * 4096)  # default preset: 8 MiB dictionary
+    info = zipfile.ZipInfo('classes.dex')
+    info.file_size = 8192
+    info.compress_size = len(payload)
+
+    assert scanner._decompress_xz_entry(io.BytesIO(payload), info, 0) is None
 
 
 def test_scan_applies_typing_to_xz_entries(scanner: Scanner):
