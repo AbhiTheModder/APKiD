@@ -31,7 +31,7 @@ import struct
 import sys
 import traceback
 import zipfile
-from typing import Union, IO, List, Dict, Set
+from typing import Union, IO, List, Dict, Set, Callable
 
 import yara_x as yara
 
@@ -48,6 +48,18 @@ SCANNABLE_FILE_MAGICS: Dict[str, Set[bytes]] = {
     # 'axml': set(),
 }
 XZ_COMPRESSION_TYPE = 95
+DEFAULT_ENTRY_MAX_SCAN_SIZE = 100 * 1024 * 1024
+# The LZMA2 decoder allocates memory proportional to the dictionary size, which
+# the stream header declares. Entry bodies are otherwise capped by the scan
+# budget, so this floor only has to cover real-world encoder presets: xz -9 uses
+# a 64 MiB dictionary, plus a little room for the decoder's own state.
+MIN_DECODER_MEMORY = 128 * 1024 * 1024
+# Compressed XZ bytes are read in blocks, so a lying `compress_size` cannot force
+# the whole entry into memory before the decoder gets a say.
+XZ_COMPRESSED_READ_SIZE = 64 * 1024
+# Number of leading bytes `_should_scan()` needs to run the magic check.
+SCAN_MAGIC_SIZE = 4
+ENTRY_READ_CHUNK_SIZE = 1024 * 1024
 ZIP_LFH_SIG_SIZE = 4
 ZIP_LFH_FIELDS_SIZE = 26
 ZIP_LFH_HEADER_SIZE = ZIP_LFH_SIG_SIZE + ZIP_LFH_FIELDS_SIZE
@@ -56,7 +68,8 @@ ZIP_LFH_HEADER_SIZE = ZIP_LFH_SIG_SIZE + ZIP_LFH_FIELDS_SIZE
 class Options(object):
 
     def __init__(self, timeout: int = 10, verbose: bool = False, json: bool = False, output_dir: Union[str, None] = None,
-                 typing: Union[str, None] = 'magic', entry_max_scan_size: int = 0, scan_depth=2, recursive: bool = False,
+                 typing: Union[str, None] = 'magic', entry_max_scan_size: int = DEFAULT_ENTRY_MAX_SCAN_SIZE,
+                 scan_depth=2, recursive: bool = False,
                  include_trackers: bool = False, include_types: bool = False, print_filter: PrintFilter = None):
         """Scan options.
         Holds user-supplied options governing how APKiD behaves.
@@ -82,8 +95,10 @@ class Options(object):
             But in many cases files may not have the correct extension, e.g. a DEX file may be named "notmalware.gif". On the other extreme, one could
             simply decompress every file and scan it, but this is wasteful because most files in an APK are typically not interesting, e.g. images.
             The default behavior of "magic" only needs to read a few bytes to decide if a file should be completely uncompressed.
-        entry_max_scan_size : integer, optional (default=0)
-            If > 0, only scan APK entries if their uncompressed size is less than this value.
+        entry_max_scan_size : integer, optional (default=100 MiB)
+            Size budget, in bytes, for a single ZIP entry. Entries larger than the
+            budget are skipped instead of being decompressed and scanned.
+            If 0, no budget is applied.
         scan_depth : integer, optional (default=2)
             Determines how many times scanner should recurse into nested archives.
             If 0, don't recurse into nested archives.
@@ -198,15 +213,43 @@ class Scanner(object):
         return results
 
     def _scan_zip_entry(self, zf, info, results, depth, prefix='') -> None:
+        budget = self.options.entry_max_scan_size
+        budget = budget if budget > 0 else None
+
         try:
             with zf.open(info) as entry:
+                # The declared size is attacker-controlled, so this is only a
+                # cheap early reject, but it is also sufficient: `ZipExtFile`
+                # stops reading at `info.file_size`, so a header that
+                # understates the size cannot make the read below return more
+                # than the budget.
+                if budget is not None and info.file_size > budget:
+                    if self.options.verbose:
+                        print(f"[W] Skipping entry {info.filename}: "
+                              f"declared size {info.file_size} exceeds {budget}")
+                    return
                 # Python 3.6 zip entries are not seek'able :(
-                entry_buffer: IO = io.BytesIO(entry.read(4))
+                head = entry.read(SCAN_MAGIC_SIZE)
+                entry_buffer: IO = io.BytesIO(head)
                 entry_buffer.seek(0)
                 if not self._should_scan(entry_buffer, info.filename):
                     return
-                entry_buffer.seek(4)
-                entry_buffer.write(entry.read())
+                entry_buffer.seek(len(head))
+                if budget is None:
+                    entry_buffer.write(entry.read())
+                else:
+                    # `read()` stops at `info.file_size`, but that bounds what
+                    # is kept, not the decoder's own allocation: given no
+                    # length, `zipfile` reads as much compressed input as
+                    # `compress_size` declares and inflates it in one call
+                    # before trimming to the declared size. Chunked reads keep
+                    # a single call bounded even when the header understates
+                    # the size.
+                    while True:
+                        chunk = entry.read(ENTRY_READ_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        entry_buffer.write(chunk)
         except zipfile.BadZipFile as e:
             if "Overlapped entries" in str(e) or "possible zip bomb" in str(e):
                 if self.options.verbose:
@@ -217,19 +260,27 @@ class Scanner(object):
         except NotImplementedError:
             # XZ-compression
             if info.compress_type == XZ_COMPRESSION_TYPE:
+                # `--typing filename` only needs the entry name, so it can be
+                # decided without decompressing anything.
+                if self.options.typing == 'filename' and not self._should_scan(io.BytesIO(b''), info.filename):
+                    return
+                # Only `--typing magic` needs the filter to peek at the
+                # decompressed bytes; `filename` was decided above, and
+                # `typing` None scans everything.
+                def peek_magic(head: bytes) -> bool:
+                    return self._should_scan(io.BytesIO(head), info.filename)
+
+                should_scan = peek_magic if self.options.typing == 'magic' else None
                 with open(zf.filename, 'rb') as raw_zip:
                     raw_zip.seek(info.header_offset + ZIP_LFH_FIELDS_SIZE)
                     filename_len = struct.unpack('<H', raw_zip.read(2))[0]
                     extra_len = struct.unpack('<H', raw_zip.read(2))[0]
                     data_offset = info.header_offset + ZIP_LFH_HEADER_SIZE + filename_len + extra_len
-                    raw_zip.seek(data_offset)
-                    compressed_data = raw_zip.read(info.compress_size)
-                    try:
-                        decompressed_data = lzma.decompress(compressed_data)
-                        entry_buffer = io.BytesIO(decompressed_data)
-                    except Exception as e:
-                        print(f"[E] Failed to decompress {info.filename}: {e}")
+                    decompressed_data = self._decompress_xz_entry(
+                        raw_zip, info, data_offset, should_scan=should_scan)
+                    if decompressed_data is None:
                         return
+                    entry_buffer = io.BytesIO(decompressed_data)
             else:
                 print(f"[E] Unsupported compression method {info.compress_type} for {info.filename}")
                 return
@@ -251,9 +302,142 @@ class Scanner(object):
                 for nested_name, nested_matches in nested_results.items():
                     results[f'{info.filename}!{nested_name}'] = nested_matches
 
+    def _decompress_xz_entry(self, raw_zip: IO, info: zipfile.ZipInfo, data_offset: int,
+                             should_scan: Callable[[bytes], bool] = None) -> Union[bytes, None]:
+        """Decompress an XZ-compressed ZIP entry within a bounded budget.
+
+        `zipfile` cannot read method-95 entries, so their raw bytes are fed to
+        `lzma` here. `lzma.decompress()` would happily materialize gigabytes
+        from a few kilobytes of input, so decompression stops as soon as the
+        output would exceed the `entry_max_scan_size` budget, and the decoder
+        itself runs with a memory limit. A budget of 0 disables the size check,
+        while the decoder memory limit still applies.
+
+        `should_scan`, when given, is applied to the first `SCAN_MAGIC_SIZE`
+        bytes of the entry, so `--typing` can drop it before the rest is
+        materialized.
+
+        Returns the decompressed bytes, or None when the entry is too large,
+        filtered out, or the stream is malformed.
+        """
+        max_size = self.options.entry_max_scan_size
+        # 0 disables the budget, as documented; negative values are treated the same.
+        budget = max_size if max_size > 0 else None
+
+        # The declared size is attacker-controlled, so this is a cheap early
+        # reject that saves reading the entry at all; the budget below is what
+        # actually holds when the header lies.
+        if budget is not None and info.file_size > budget:
+            if self.options.verbose:
+                print(f"[W] Skipping XZ entry {info.filename}: "
+                      f"declared size {info.file_size} exceeds {budget}")
+            return None
+
+        raw_zip.seek(data_offset)
+        # Read the compressed bytes in blocks instead of buffering the whole
+        # entry up front: `compress_size` is attacker-controlled too.
+        input_remaining = info.compress_size
+        decoder_memory_limit = max(budget or 0, MIN_DECODER_MEMORY)
+        decompressor = lzma.LZMADecompressor(memlimit=decoder_memory_limit)
+        output = bytearray()
+        pending = b''
+        filtered = should_scan is None
+        # Where the current stream's output starts, and how many streams are
+        # already complete: a failed tail is dropped back to `stream_start`,
+        # the way `lzma.decompress()` only keeps completed streams.
+        stream_start = 0
+        completed_streams = 0
+        while True:
+            if pending:
+                block, pending = pending, b''
+            elif decompressor.needs_input:
+                block = b''
+                if input_remaining > 0:
+                    block = raw_zip.read(min(input_remaining, XZ_COMPRESSED_READ_SIZE))
+                    input_remaining -= len(block)
+                if not block:
+                    # The input ended inside a stream. `lzma.decompress()`
+                    # rejects this even when earlier streams completed, so the
+                    # entry is malformed rather than a valid prefix.
+                    print(f"[E] Failed to decompress {info.filename}: truncated XZ stream",
+                          file=sys.stderr)
+                    return None
+            else:
+                block = b''
+
+            if budget is None:
+                max_length = -1
+            else:
+                max_length = budget + 1 - len(output)
+            if not filtered:
+                # Stop as soon as `_should_scan()` has the bytes it needs.
+                peek = SCAN_MAGIC_SIZE - len(output)
+                max_length = peek if max_length < 0 else min(max_length, peek)
+
+            try:
+                chunk = decompressor.decompress(block, max_length=max_length)
+            except lzma.LZMAError as e:
+                # A tail that is not a stream (trailing junk) is ignored and
+                # the completed streams are kept, as `lzma.decompress()` does.
+                # A memory-limit refusal is not a bad tail: the data asked for
+                # more decoder memory than allowed, so the entry is rejected
+                # rather than scanned in part.
+                if completed_streams and 'memory usage limit' not in str(e).lower():
+                    del output[stream_start:]
+                    break
+                print(f"[E] Failed to decompress {info.filename}: {e}", file=sys.stderr)
+                return None
+
+            output += chunk
+
+            if budget is not None and len(output) > budget:
+                if self.options.verbose:
+                    print(f"[W] Skipping XZ entry {info.filename}: "
+                          f"decompressed size exceeds {budget}")
+                return None
+
+            # The filter sees the entry's first bytes, so it waits until they
+            # exist instead of judging a short first stream.
+            if not filtered and len(output) >= SCAN_MAGIC_SIZE:
+                if not should_scan(bytes(output[:SCAN_MAGIC_SIZE])):
+                    return None
+                filtered = True
+
+            if decompressor.eof:
+                completed_streams += 1
+                # XZ allows concatenated streams, and `lzma.decompress()` consumes them all.
+                pending = decompressor.unused_data
+                stream_start = len(output)
+                # Stream Padding is a multiple of four null bytes between or
+                # after streams. It is valid XZ, so it is skipped rather than
+                # mistaken for a new stream that the input cuts short.
+                padding = 0
+                while True:
+                    stripped = pending.lstrip(b'\x00')
+                    padding += len(pending) - len(stripped)
+                    pending = stripped
+                    if pending or input_remaining <= 0:
+                        break
+                    pending = raw_zip.read(min(input_remaining, XZ_COMPRESSED_READ_SIZE))
+                    input_remaining -= len(pending)
+                    if not pending:
+                        break
+                if padding % 4:
+                    print(f"[E] Failed to decompress {info.filename}: "
+                          f"invalid XZ stream padding", file=sys.stderr)
+                    return None
+                if not pending:
+                    break
+                decompressor = lzma.LZMADecompressor(memlimit=decoder_memory_limit)
+
+        if not filtered and not should_scan(bytes(output[:SCAN_MAGIC_SIZE])):
+            return None
+
+        return bytes(output)
+
     @staticmethod
     def _type_file(file: IO) -> Union[None, str]:
-        magic = file.read(4)
+        magic = file.read(SCAN_MAGIC_SIZE)
         file.seek(0)
         for file_type, magics in SCANNABLE_FILE_MAGICS.items():
             if magic in magics:
